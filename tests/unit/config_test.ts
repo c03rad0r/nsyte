@@ -6,12 +6,14 @@ import {
   type ProjectConfig,
   type ProjectContext,
   readProjectFile,
+  resolveSetupOverrides,
+  type SetupOverrides,
   setupProject,
   writeProjectFile,
 } from "../../src/lib/config.ts";
+import { encodeBunkerInfo } from "../../src/lib/nip46.ts";
 import {
   createMockConfig,
-  type createTestEnvironment,
   createTestEnvVars,
   suppressConsole,
   withTestEnvironment,
@@ -67,7 +69,7 @@ Deno.test(
       assertEquals(fileStats.isFile, true);
     });
 
-    await t.step("writeProjectFile sanitizes bunker URLs", async () => {
+    await t.step("writeProjectFile sanitizes bunker URLs", () => {
       const config: ProjectConfig = {
         relays: ["wss://test.relay"],
         servers: ["https://test.server"],
@@ -303,7 +305,7 @@ Deno.test(
       assertEquals(result, null);
     });
 
-    await t.step("mono-repo scenario: multiple configs in different paths", async () => {
+    await t.step("mono-repo scenario: multiple configs in different paths", () => {
       // Simulate a mono-repo with two apps
       const app1ConfigPath = `${env.tempDir}/apps/frontend/.nsite/config.json`;
       const app2ConfigPath = `${env.tempDir}/apps/backend/.nsite/config.json`;
@@ -336,5 +338,253 @@ Deno.test(
       assertEquals(readApp1!.relays[0], "wss://frontend.relay");
       assertEquals(readApp2!.relays[0], "wss://backend.relay");
     });
+  }),
+);
+
+// Override + environment-variable resolution tests (no environment needed)
+Deno.test("Config - resolveSetupOverrides", async (t) => {
+  await t.step("CLI flags take precedence over env vars", () => {
+    const envVars = createTestEnvVars();
+    try {
+      envVars.set("NSITE_NSEC", "nsec1envvalue");
+      envVars.set("NSITE_RELAYS", "wss://env.relay");
+      const resolved = resolveSetupOverrides({ sec: "nsec1cli", relays: "wss://cli.relay" });
+      assertEquals(resolved.sec, "nsec1cli");
+      assertEquals(resolved.relays, ["wss://cli.relay"]);
+      assertEquals(resolved.nonInteractive, false);
+    } finally {
+      envVars.restore();
+    }
+  });
+
+  await t.step("env vars used when no CLI flag is provided", () => {
+    const envVars = createTestEnvVars();
+    try {
+      envVars.set("NSITE_NSEC", "nsec1envvalue");
+      envVars.set("NOSTR_NSEC", "nsec1othervalue"); // NSITE_NSEC takes priority
+      envVars.set("NSITE_RELAYS", "wss://a.relay, wss://b.relay");
+      envVars.set("NSITE_SERVERS", "https://s1,https://s2");
+      envVars.set("NSITE_SITE_ID", "blog");
+      envVars.set("NSITE_BUNKER", "bunker://envbunker");
+
+      const resolved = resolveSetupOverrides();
+      assertEquals(resolved.sec, "nsec1envvalue");
+      assertEquals(resolved.relays, ["wss://a.relay", "wss://b.relay"]);
+      assertEquals(resolved.servers, ["https://s1", "https://s2"]);
+      assertEquals(resolved.site, "blog");
+      assertEquals(resolved.bunker, "bunker://envbunker");
+    } finally {
+      envVars.restore();
+    }
+  });
+
+  await t.step("NBUNK_SECRET is used as the signing secret when NSITE_NSEC is absent", () => {
+    const envVars = createTestEnvVars();
+    try {
+      envVars.set("NBUNK_SECRET", "nbunksec1fromenv");
+      const resolved = resolveSetupOverrides();
+      assertEquals(resolved.sec, "nbunksec1fromenv");
+    } finally {
+      envVars.restore();
+    }
+  });
+
+  await t.step("nonInteractive is set by the flag or NSITE_NON_INTERACTIVE env", () => {
+    assertEquals(resolveSetupOverrides({ nonInteractive: true }).nonInteractive, true);
+    assertEquals(resolveSetupOverrides({ nonInteractive: false }).nonInteractive, false);
+
+    const envVars = createTestEnvVars();
+    try {
+      envVars.set("NSITE_NON_INTERACTIVE", "1");
+      assertEquals(resolveSetupOverrides().nonInteractive, true);
+      envVars.set("NSITE_NON_INTERACTIVE", "true");
+      assertEquals(resolveSetupOverrides().nonInteractive, true);
+      envVars.set("NSITE_NON_INTERACTIVE", "no");
+      assertEquals(resolveSetupOverrides().nonInteractive, false);
+    } finally {
+      envVars.restore();
+    }
+  });
+
+  await t.step("defaults to empty when no flags or env vars are set", () => {
+    const resolved = resolveSetupOverrides();
+    assertEquals(resolved.sec, undefined);
+    assertEquals(resolved.bunker, undefined);
+    assertEquals(resolved.relays, []);
+    assertEquals(resolved.servers, []);
+    assertEquals(resolved.site, undefined);
+    assertEquals(resolved.nonInteractive, false);
+  });
+
+  await t.step("list parsing trims and drops empty entries", () => {
+    const resolved = resolveSetupOverrides({
+      relays: " wss://one , , wss://two ",
+      servers: "https://only",
+    });
+    assertEquals(resolved.relays, ["wss://one", "wss://two"]);
+    assertEquals(resolved.servers, ["https://only"]);
+  });
+});
+
+// Non-interactive setupProject tests with isolated environment
+Deno.test(
+  "Config - non-interactive setupProject",
+  withTestEnvironment(async (env, t) => {
+    // A realistic but throwaway nsec. detectSecretFormat accepts any nsec1-prefixed
+    // string; the non-interactive path never decodes it, it just echoes it back.
+    const TEST_NSEC = "nsec1zxcv0000112233445566778899aabbccddeeff00112233";
+    const envVars = createTestEnvVars();
+
+    /** Remove any leftover config so each step starts clean. */
+    async function cleanConfig() {
+      try {
+        await Deno.remove(env.configFile);
+      } catch {
+        // already absent
+      }
+    }
+
+    try {
+      await t.step("creates config from --sec + --relays with zero prompts", async () => {
+        await cleanConfig();
+        const overrides: SetupOverrides = {
+          sec: TEST_NSEC,
+          relays: "wss://relay.ngit.dev,wss://nos.lol",
+          nonInteractive: true,
+        };
+
+        const restoreConsole = suppressConsole();
+        let result: ProjectContext;
+        try {
+          result = await setupProject(false, env.configFile, overrides);
+        } finally {
+          restoreConsole();
+        }
+
+        assertEquals(result.error, undefined);
+        assertEquals(result.privateKey, TEST_NSEC);
+        assertEquals(result.config.relays, ["wss://relay.ngit.dev", "wss://nos.lol"]);
+        assertEquals(result.config.servers, []);
+
+        // Config file written and contains valid JSON
+        const raw = await Deno.readTextFile(env.configFile);
+        const parsed = JSON.parse(raw);
+        assertEquals(parsed.relays, ["wss://relay.ngit.dev", "wss://nos.lol"]);
+        assertEquals(Array.isArray(parsed.servers), true);
+      });
+
+      await t.step("works with env vars only (NSITE_NSEC + NSITE_RELAYS)", async () => {
+        await cleanConfig();
+        envVars.set("NSITE_NSEC", TEST_NSEC);
+        envVars.set("NSITE_RELAYS", "wss://nos.lol");
+
+        const restoreConsole = suppressConsole();
+        let result: ProjectContext;
+        try {
+          result = await setupProject(false, env.configFile, { nonInteractive: true });
+        } finally {
+          restoreConsole();
+        }
+
+        assertEquals(result.error, undefined);
+        assertEquals(result.privateKey, TEST_NSEC);
+        assertEquals(result.config.relays, ["wss://nos.lol"]);
+
+        // Restore env vars immediately so they don't leak into subsequent steps.
+        envVars.restore();
+      });
+
+      await t.step("errors when signing key is missing in non-interactive mode", async () => {
+        await cleanConfig();
+        const restoreConsole = suppressConsole();
+        let result: ProjectContext;
+        try {
+          result = await setupProject(false, env.configFile, {
+            relays: "wss://nos.lol",
+            nonInteractive: true,
+          });
+        } finally {
+          restoreConsole();
+        }
+        assertExists(result.error);
+        assertEquals(typeof result.error, "string");
+      });
+
+      await t.step("nbunksec override stores the derived bunker pubkey", async () => {
+        await cleanConfig();
+        const pubkey = "a".repeat(64);
+        const nbunk = encodeBunkerInfo({
+          pubkey,
+          relays: ["wss://relay.test"],
+          local_key: "b".repeat(64),
+        });
+
+        const restoreConsole = suppressConsole();
+        let result: ProjectContext;
+        try {
+          result = await setupProject(false, env.configFile, {
+            sec: nbunk,
+            nonInteractive: true,
+          });
+        } finally {
+          restoreConsole();
+        }
+
+        assertEquals(result.error, undefined);
+        assertEquals(result.config.bunkerPubkey, pubkey);
+      });
+
+      await t.step("rejects an invalid site identifier in non-interactive mode", async () => {
+        await cleanConfig();
+        const restoreConsole = suppressConsole();
+        let result: ProjectContext;
+        try {
+          result = await setupProject(false, env.configFile, {
+            sec: TEST_NSEC,
+            site: "this_identifier_is_far_too_long",
+            nonInteractive: true,
+          });
+        } finally {
+          restoreConsole();
+        }
+        assertExists(result.error);
+      });
+
+      await t.step("--site root produces a null id (root site)", async () => {
+        await cleanConfig();
+        const restoreConsole = suppressConsole();
+        let result: ProjectContext;
+        try {
+          result = await setupProject(false, env.configFile, {
+            sec: TEST_NSEC,
+            relays: "wss://nos.lol",
+            site: "root",
+            nonInteractive: true,
+          });
+        } finally {
+          restoreConsole();
+        }
+        assertEquals(result.error, undefined);
+        assertEquals(result.config.id, null);
+      });
+
+      await t.step("invalid secret format returns an error", async () => {
+        await cleanConfig();
+        const restoreConsole = suppressConsole();
+        let result: ProjectContext;
+        try {
+          result = await setupProject(false, env.configFile, {
+            sec: "not-a-valid-secret-format",
+            relays: "wss://nos.lol",
+            nonInteractive: true,
+          });
+        } finally {
+          restoreConsole();
+        }
+        assertExists(result.error);
+      });
+    } finally {
+      envVars.restore();
+    }
   }),
 );

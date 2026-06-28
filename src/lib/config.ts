@@ -3,10 +3,12 @@ import { Input, Secret, Select } from "@cliffy/prompt";
 import { ensureDirSync } from "@std/fs/ensure-dir";
 import { dirname, isAbsolute, join, resolve } from "@std/path";
 import { NostrConnectSigner } from "applesauce-signers";
+import { detectSecretFormat } from "./auth/secret-detector.ts";
 import { formatValidationErrors, validateConfigWithFeedback } from "./config-validator.ts";
+import { getErrorMessage } from "./error-utils.ts";
 import { createLogger } from "./logger.ts";
 import { suggestIdentifier, validateDTag } from "./nip5a.ts";
-import { getNbunkString, initiateNostrConnect } from "./nip46.ts";
+import { decodeBunkerInfo, getNbunkString, initiateNostrConnect, parseBunkerUrl } from "./nip46.ts";
 import { generateKeyPair } from "./nostr.ts";
 import { SecretsManager } from "./secrets/mod.ts";
 
@@ -328,14 +330,250 @@ function fileExists(filePath: string): boolean {
 }
 
 /**
- * Setup project interactively
- * @param skipInteractive If true, will return a basic configuration without prompting
- * @param configPath - Optional custom path to config file
+ * Overrides supplied by the caller (typically from CLI flags). Values are the
+ * raw strings exactly as received on the command line — list-style fields
+ * (`relays`, `servers`) are comma-separated and parsed during resolution.
+ */
+export interface SetupOverrides {
+  /** Signing secret (auto-detects format: nsec, nbunksec, bunker:// URL, hex). */
+  sec?: string;
+  /** NIP-46 bunker URL (alternative to sec). */
+  bunker?: string;
+  /** Comma-separated relay URLs. */
+  relays?: string;
+  /** Comma-separated Blossom server URLs. */
+  servers?: string;
+  /** Site identifier (use "root" for the root site). */
+  site?: string;
+  /** When true, never prompt — error on missing required values instead. */
+  nonInteractive?: boolean;
+}
+
+/**
+ * Fully-resolved setup inputs after merging CLI overrides with environment
+ * variables (CLI flag wins, then env var, then undefined). List fields are
+ * parsed into arrays.
+ */
+export interface ResolvedSetup {
+  sec?: string;
+  bunker?: string;
+  relays: string[];
+  servers: string[];
+  site?: string;
+  nonInteractive: boolean;
+}
+
+/** Read an environment variable, treating empty string as unset. Env access
+ * is wrapped so the function is safe even without --allow-env. */
+function getEnv(key: string): string | undefined {
+  try {
+    const value = Deno.env.get(key);
+    return value && value.trim() !== "" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Parse a comma-separated list string into a trimmed, non-empty array. */
+function parseList(value?: string): string[] {
+  if (!value) return [];
+  return value.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/** Interpret a truthy env var ("1", "true", "yes", "on", case-insensitive). */
+function envBool(key: string): boolean {
+  const v = getEnv(key);
+  return v !== undefined && ["1", "true", "yes", "on"].includes(v.toLowerCase());
+}
+
+/**
+ * Merge CLI overrides with environment variables.
+ *
+ * Precedence: explicit CLI flag > environment variable > undefined.
+ *
+ * Supported env vars:
+ *   NSITE_NSEC / NOSTR_NSEC / NBUNK_SECRET -> signing secret
+ *   NSITE_BUNKER                            -> bunker URL
+ *   NSITE_RELAYS                            -> comma-separated relays
+ *   NSITE_SERVERS                           -> comma-separated Blossom servers
+ *   NSITE_SITE_ID                           -> site identifier
+ *   NSITE_NON_INTERACTIVE                   -> non-interactive mode (1/true/yes/on)
+ */
+export function resolveSetupOverrides(overrides: SetupOverrides = {}): ResolvedSetup {
+  const sec = overrides.sec ?? getEnv("NSITE_NSEC") ?? getEnv("NOSTR_NSEC") ??
+    getEnv("NBUNK_SECRET");
+  const bunker = overrides.bunker ?? getEnv("NSITE_BUNKER");
+  const relays = parseList(overrides.relays ?? getEnv("NSITE_RELAYS"));
+  const servers = parseList(overrides.servers ?? getEnv("NSITE_SERVERS"));
+  const site = overrides.site ?? getEnv("NSITE_SITE_ID");
+  const nonInteractive = overrides.nonInteractive === true || envBool("NSITE_NON_INTERACTIVE");
+
+  return { sec, bunker, relays, servers, site, nonInteractive };
+}
+
+/** Persist an nbunksec credential, swallowing keychain errors so a non-interactive
+ * init never fails solely because secure storage is unavailable. */
+async function storeNbunkSafe(pubkey: string, nbunk: string): Promise<void> {
+  try {
+    const secretsManager = SecretsManager.getInstance();
+    await secretsManager.storeNbunk(pubkey, nbunk);
+  } catch (e) {
+    log.warn(`Could not store bunker credential in secrets manager: ${getErrorMessage(e)}`);
+  }
+}
+
+/**
+ * Build a project configuration entirely from resolved overrides/environment
+ * without any TTY interaction. Writes the resulting config and returns it.
+ *
+ * Signing secret handling (network-free):
+ *  - nsec / hex    -> returned as `privateKey`, never written to config
+ *  - nbunksec      -> pubkey stored in config, full credential stored in the
+ *                     secrets manager (self-contained, no relay handshake needed)
+ *  - bunker:// URL -> pubkey stored in config; the full credential must be
+ *                     supplied again at deploy time via --sec/--bunker
+ */
+async function nonInteractiveSetup(
+  existing: ProjectConfig | null,
+  resolved: ResolvedSetup,
+  configPath?: string,
+): Promise<ProjectContext> {
+  const hasKey = !!resolved.sec || !!resolved.bunker || !!existing?.bunkerPubkey;
+  if (!hasKey) {
+    return {
+      config: existing ?? { ...defaultConfig },
+      privateKey: undefined,
+      error:
+        "Missing signing key: provide --sec/--bunker or set NSITE_NSEC/NOSTR_NSEC/NBUNK_SECRET/NSITE_BUNKER for non-interactive init.",
+    };
+  }
+
+  const relays = resolved.relays.length > 0 ? resolved.relays : (existing?.relays ?? []);
+  const servers = resolved.servers.length > 0 ? resolved.servers : (existing?.servers ?? []);
+
+  if (relays.length === 0 && servers.length === 0) {
+    log.warn(
+      "No relays or servers provided for non-interactive init — config will be written but deploy will need --relays/--servers or published relay/server lists.",
+    );
+  }
+
+  // Resolve site identifier: explicit override > existing > root (null)
+  let siteId: string | null;
+  if (resolved.site !== undefined) {
+    const trimmed = resolved.site.trim();
+    siteId = trimmed === "" || trimmed === "root" ? null : trimmed;
+  } else if (existing?.id !== undefined && existing.id !== null && existing.id !== "") {
+    siteId = existing.id;
+  } else {
+    siteId = null;
+  }
+
+  if (siteId) {
+    const validation = validateDTag(siteId);
+    if (!validation.valid) {
+      const suggestion = suggestIdentifier(siteId);
+      const hint = suggestion !== siteId ? ` Try "${suggestion}".` : "";
+      return {
+        config: { ...defaultConfig, relays, servers, id: siteId },
+        privateKey: undefined,
+        error: `Invalid site identifier "${siteId}": ${validation.error}.${hint}`,
+      };
+    }
+  }
+
+  const config: ProjectConfig = {
+    "$schema": existing?.$schema ?? CONFIG_SCHEMA_URL,
+    relays,
+    servers,
+    id: siteId,
+    bunkerPubkey: existing?.bunkerPubkey,
+    gatewayHostnames: existing?.gatewayHostnames ?? ["nsite.lol"],
+  };
+  if (existing?.title) config.title = existing.title;
+  if (existing?.description) config.description = existing.description;
+  if (existing?.source) config.source = existing.source;
+
+  let privateKey: string | undefined;
+
+  const secretForAuth = resolved.sec ?? resolved.bunker;
+  if (secretForAuth) {
+    const detected = detectSecretFormat(secretForAuth);
+    if (!detected) {
+      return {
+        config,
+        privateKey: undefined,
+        error: `Invalid secret format: "${
+          secretForAuth.slice(0, 12)
+        }...". Expected nsec, nbunksec, bunker:// URL, or 64-char hex.`,
+      };
+    }
+    switch (detected.format) {
+      case "nsec":
+      case "hex":
+        privateKey = detected.value;
+        break;
+      case "nbunksec": {
+        try {
+          const info = decodeBunkerInfo(detected.value);
+          config.bunkerPubkey = info.pubkey;
+          await storeNbunkSafe(info.pubkey, detected.value);
+        } catch (e) {
+          return {
+            config,
+            privateKey: undefined,
+            error: `Failed to decode nbunksec: ${getErrorMessage(e)}`,
+          };
+        }
+        break;
+      }
+      case "bunker-url": {
+        try {
+          const pointer = parseBunkerUrl(detected.value);
+          config.bunkerPubkey = pointer.pubkey;
+          // A bunker URL needs a live handshake to derive a storable nbunksec,
+          // which we avoid here to keep init network-free. The full credential
+          // must be passed again at deploy time via --sec/--bunker.
+          log.info(
+            `Configured bunker ${
+              pointer.pubkey.slice(0, 8)
+            }... — supply the bunker URL via --sec/--bunker at deploy time.`,
+          );
+        } catch (e) {
+          return {
+            config,
+            privateKey: undefined,
+            error: `Failed to parse bunker URL: ${getErrorMessage(e)}`,
+          };
+        }
+        break;
+      }
+    }
+  }
+
+  writeProjectFile(config, configPath);
+  return { config, privateKey };
+}
+
+/**
+ * Setup project configuration.
+ *
+ * @param skipInteractive If true, return a basic configuration without prompting
+ *                        (legacy behaviour used by some non-init code paths).
+ * @param configPath      Optional custom path to config file.
+ * @param overrides       Optional CLI/env overrides. When `nonInteractive` is set
+ *                        (or `NSITE_NON_INTERACTIVE` is truthy), the project is
+ *                        bootstrapped entirely from overrides/environment with
+ *                        zero TTY interaction; provided values also skip their
+ *                        corresponding prompts in interactive mode.
  */
 export async function setupProject(
   skipInteractive = false,
   configPath?: string,
+  overrides: SetupOverrides = {},
 ): Promise<ProjectContext> {
+  const resolved = resolveSetupOverrides(overrides);
+  const nonInteractive = resolved.nonInteractive;
+
   let config: ProjectConfig | null = null;
   let privateKey: string | undefined;
 
@@ -355,6 +593,11 @@ export async function setupProject(
     config = null;
   }
 
+  // Non-interactive, override-driven bootstrap (no TTY).
+  if (nonInteractive) {
+    return nonInteractiveSetup(config, resolved, configPath);
+  }
+
   if (!config) {
     if (skipInteractive) {
       // Return a basic configuration without prompting
@@ -367,13 +610,13 @@ export async function setupProject(
     }
 
     console.log(colors.cyan("No existing project configuration found. Setting up a new one:"));
-    const setupResult = await interactiveSetup();
+    const setupResult = await interactiveSetup(resolved);
     config = setupResult.config;
     privateKey = setupResult.privateKey;
     writeProjectFile(config, configPath);
   }
 
-  // In non-interactive mode, don't proceed with key setup prompts
+  // In legacy non-interactive mode, don't proceed with key setup prompts
   if (skipInteractive) {
     if (!config.bunkerPubkey && !privateKey) {
       log.error(
@@ -384,9 +627,18 @@ export async function setupProject(
     return { config, privateKey };
   }
 
-  // Only proceed with interactive key setup if we're in interactive mode
+  // Only proceed with interactive key setup if we're in interactive mode and no
+  // key is configured or supplied via overrides.
+  const overrideKey = resolved.sec ?? resolved.bunker;
+  if (overrideKey) {
+    const detected = detectSecretFormat(overrideKey);
+    if (detected && (detected.format === "nsec" || detected.format === "hex")) {
+      privateKey = detected.value;
+    }
+  }
+
   if (!config.bunkerPubkey && !privateKey) {
-    const keyResult = await selectKeySource(config, configPath);
+    const keyResult = await selectKeySource(config, configPath, resolved);
     config = keyResult.config;
     privateKey = keyResult.privateKey;
   }
@@ -479,7 +731,43 @@ async function newBunker(): Promise<NostrConnectSigner | undefined> {
 async function selectKeySource(
   existingConfig?: ProjectConfig,
   configPath?: string,
+  resolved?: ResolvedSetup,
 ): Promise<{ config: ProjectConfig; privateKey?: string }> {
+  // If a signing secret was supplied via overrides, resolve it directly without
+  // prompting (mirrors the non-interactive key handling, network-free).
+  const overrideSecret = resolved?.sec ?? resolved?.bunker;
+  if (overrideSecret) {
+    const config: ProjectConfig = existingConfig
+      ? structuredClone(existingConfig)
+      : structuredClone(defaultConfig);
+    let privateKey: string | undefined;
+    const detected = detectSecretFormat(overrideSecret);
+    if (detected) {
+      if (detected.format === "nsec" || detected.format === "hex") {
+        privateKey = detected.value;
+      } else if (detected.format === "nbunksec") {
+        try {
+          const info = decodeBunkerInfo(detected.value);
+          config.bunkerPubkey = info.pubkey;
+          await storeNbunkSafe(info.pubkey, detected.value);
+        } catch (e) {
+          log.warn(`Could not decode nbunksec override: ${getErrorMessage(e)}`);
+        }
+      } else if (detected.format === "bunker-url") {
+        try {
+          config.bunkerPubkey = parseBunkerUrl(detected.value).pubkey;
+        } catch (e) {
+          log.warn(`Could not parse bunker URL override: ${getErrorMessage(e)}`);
+        }
+      }
+      if (privateKey || config.bunkerPubkey) {
+        writeProjectFile(config, configPath);
+        console.log(colors.green("Key configuration applied from CLI/env override."));
+        return { config, privateKey };
+      }
+    }
+  }
+
   console.log(colors.yellow("No key configuration found. Let's set that up:"));
 
   let privateKey: string | undefined;
@@ -585,8 +873,47 @@ async function selectKeySource(
 /**
  * Interactive project setup
  */
-async function interactiveSetup(): Promise<ProjectContext> {
+async function interactiveSetup(resolved?: ResolvedSetup): Promise<ProjectContext> {
   console.log(colors.cyan("Welcome to nsyte setup!"));
+
+  let privateKey: string | undefined;
+  let bunkerPubkey: string | undefined;
+  let keyFromOverride = false;
+
+  // Honor an explicit signing secret override without prompting.
+  const overrideSecret = resolved?.sec ?? resolved?.bunker;
+  if (overrideSecret) {
+    const detected = detectSecretFormat(overrideSecret);
+    if (detected) {
+      if (detected.format === "nsec" || detected.format === "hex") {
+        privateKey = detected.value;
+        keyFromOverride = true;
+        console.log(colors.green("Using signing key from CLI/env override."));
+      } else if (detected.format === "nbunksec") {
+        try {
+          const info = decodeBunkerInfo(detected.value);
+          bunkerPubkey = info.pubkey;
+          await storeNbunkSafe(info.pubkey, detected.value);
+          keyFromOverride = true;
+          console.log(
+            colors.green(`Using bunker ${info.pubkey.slice(0, 8)}... from CLI/env override.`),
+          );
+        } catch (e) {
+          log.warn(`Could not decode nbunksec override: ${getErrorMessage(e)}`);
+        }
+      } else if (detected.format === "bunker-url") {
+        try {
+          bunkerPubkey = parseBunkerUrl(detected.value).pubkey;
+          keyFromOverride = true;
+          console.log(
+            colors.green(`Using bunker ${bunkerPubkey.slice(0, 8)}... from CLI/env override.`),
+          );
+        } catch (e) {
+          log.warn(`Could not parse bunker URL override: ${getErrorMessage(e)}`);
+        }
+      }
+    }
+  }
 
   // Check if there are any existing bunkers
   const secretsManager = SecretsManager.getInstance();
@@ -611,13 +938,11 @@ async function interactiveSetup(): Promise<ProjectContext> {
   // Define the type for the key choice to avoid type errors
   type KeyChoice = "generate" | "existing" | "new_bunker" | "existing_bunker";
 
-  const keyChoice = await Select.prompt<KeyChoice>({
+  // Skip the key-selection prompt when a key was supplied via overrides.
+  const keyChoice: KeyChoice | null = keyFromOverride ? null : await Select.prompt<KeyChoice>({
     message: "How would you like to manage your nostr key?",
     options: keyOptions,
   });
-
-  let privateKey: string | undefined;
-  let bunkerPubkey: string | undefined;
 
   if (keyChoice === "generate") {
     const keyPair = generateKeyPair();
@@ -736,36 +1061,41 @@ Generated and stored nbunksec string.`));
     );
   }
 
-  // Ask if this is a root site or named site
-  const siteType = await Select.prompt<string>({
-    message: "What type of site are you creating?",
-    options: [
-      { name: "Root site - e.g., npub1xxxx.nsite.lol", value: "root" },
-      { name: "Named site - e.g., {base36pubkey}blog.nsite.lol", value: "named" },
-    ],
-  });
-
+  // Ask if this is a root site or named site (skip when --site override given)
   let siteId: string | null | undefined;
-  if (siteType === "named") {
-    const identifier = await Input.prompt({
-      message: "Enter site identifier (lowercase, max 13 chars, e.g., blog, my-site):",
-      validate: (input: string) => {
-        const trimmed = input.trim();
-        if (!trimmed) {
-          return "Site identifier is required";
-        }
-        const result = validateDTag(trimmed);
-        if (!result.valid) {
-          const suggestion = suggestIdentifier(trimmed);
-          return `${result.error}${suggestion !== trimmed ? `. Try "${suggestion}"` : ""}`;
-        }
-        return true;
-      },
-    });
-    siteId = identifier.trim();
+  if (resolved?.site !== undefined) {
+    const trimmed = resolved.site.trim();
+    siteId = trimmed === "" || trimmed === "root" ? null : trimmed;
   } else {
-    // Root site: set id to null or empty string
-    siteId = null;
+    const siteType = await Select.prompt<string>({
+      message: "What type of site are you creating?",
+      options: [
+        { name: "Root site - e.g., npub1xxxx.nsite.lol", value: "root" },
+        { name: "Named site - e.g., {base36pubkey}blog.nsite.lol", value: "named" },
+      ],
+    });
+
+    if (siteType === "named") {
+      const identifier = await Input.prompt({
+        message: "Enter site identifier (lowercase, max 13 chars, e.g., blog, my-site):",
+        validate: (input: string) => {
+          const trimmed = input.trim();
+          if (!trimmed) {
+            return "Site identifier is required";
+          }
+          const result = validateDTag(trimmed);
+          if (!result.valid) {
+            const suggestion = suggestIdentifier(trimmed);
+            return `${result.error}${suggestion !== trimmed ? `. Try "${suggestion}"` : ""}`;
+          }
+          return true;
+        },
+      });
+      siteId = identifier.trim();
+    } else {
+      // Root site: set id to null or empty string
+      siteId = null;
+    }
   }
 
   const siteTitle = await Input.prompt({
@@ -776,11 +1106,22 @@ Generated and stored nbunksec string.`));
     message: "Enter site description (optional):",
   });
 
-  console.log(colors.cyan("\nEnter nostr relay URLs (leave empty when done):"));
-  const relays = await promptForUrls("Enter relay URL:", popularRelays);
+  // Use override relays/servers when provided; otherwise prompt interactively.
+  const relays = resolved && resolved.relays.length > 0
+    ? resolved.relays
+    : await promptForUrlsWithHeader(
+      "\nEnter nostr relay URLs (leave empty when done):",
+      "Enter relay URL:",
+      popularRelays,
+    );
 
-  console.log(colors.cyan("\nEnter blossom server URLs (leave empty when done):"));
-  const servers = await promptForUrls("Enter blossom server URL:", popularBlossomServers);
+  const servers = resolved && resolved.servers.length > 0
+    ? resolved.servers
+    : await promptForUrlsWithHeader(
+      "\nEnter blossom server URLs (leave empty when done):",
+      "Enter blossom server URL:",
+      popularBlossomServers,
+    );
 
   const config: ProjectConfig = {
     "$schema": CONFIG_SCHEMA_URL,
@@ -825,4 +1166,16 @@ async function promptForUrls(message: string, suggestions: string[]): Promise<st
   }
 
   return urls;
+}
+
+/**
+ * Print a header line, then prompt for URLs with suggestions.
+ */
+function promptForUrlsWithHeader(
+  header: string,
+  message: string,
+  suggestions: string[],
+): Promise<string[]> {
+  console.log(colors.cyan(header));
+  return promptForUrls(message, suggestions);
 }

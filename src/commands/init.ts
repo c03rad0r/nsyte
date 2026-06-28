@@ -1,9 +1,43 @@
 import { colors } from "@cliffy/ansi/colors";
 import { Confirm } from "@cliffy/prompt";
 import { join } from "@std/path";
-import { configDir, setupProject } from "../lib/config.ts";
+import { configDir, type SetupOverrides, setupProject } from "../lib/config.ts";
 import { displayColorfulHeader } from "../ui/output-helpers.ts";
 import nsyte from "./root.ts";
+
+/**
+ * Options for the init command. The signing secret, relay/server lists, site
+ * identifier and bunker URL mirror `nsyte deploy` so projects can be bootstrapped
+ * non-interactively (e.g. from CI) without the Cliffy TUI.
+ */
+export interface InitCommandOptions {
+  /** Path to config file (global option). */
+  config?: string;
+  /** Signing secret (auto-detects format: nsec, nbunksec, bunker:// URL, hex). */
+  sec?: string;
+  /** Comma-separated relay URLs. */
+  relays?: string;
+  /** Comma-separated Blossom server URLs. */
+  servers?: string;
+  /** Site identifier (use "root" for the root site). */
+  site?: string;
+  /** NIP-46 bunker URL (alternative to --sec). */
+  bunker?: string;
+  /** Run without any TTY prompts; error on missing required values. */
+  nonInteractive: boolean;
+}
+
+/** Build the setup overrides object from parsed CLI options. */
+function overridesFromOptions(options: InitCommandOptions): SetupOverrides {
+  return {
+    sec: options.sec,
+    bunker: options.bunker,
+    relays: options.relays,
+    servers: options.servers,
+    site: options.site,
+    nonInteractive: options.nonInteractive === true,
+  };
+}
 
 /**
  * Register the init command
@@ -12,36 +46,37 @@ export function registerInitCommand() {
   return nsyte
     .command("init")
     .description("Initialize a new nsyte project")
-    .action(async (options) => {
+    .option(
+      "-s, --sec <secret:string>",
+      "Signing secret (auto-detects format: nsec, nbunksec, bunker:// URL, or 64-char hex). Same semantics as `nsyte deploy --sec`.",
+    )
+    .option(
+      "-r, --relays <relays:string>",
+      'Comma-separated nostr relay URLs (e.g. "wss://relay1,wss://relay2").',
+    )
+    .option(
+      "--servers <servers:string>",
+      "Comma-separated Blossom server URLs.",
+    )
+    .option(
+      "--site <id:string>",
+      'Site identifier for named sites (defaults to the root site; use "root" explicitly for root).',
+    )
+    .option(
+      "--bunker <url:string>",
+      "NIP-46 bunker URL (bunker://...). Alternative to --sec.",
+    )
+    .option(
+      "-i, --non-interactive",
+      "Skip all prompts; error if required values are missing. Env vars (NSITE_NSEC, NSITE_RELAYS, ...) are read as fallbacks.",
+      { default: false },
+    )
+    .action(async (options: InitCommandOptions) => {
       console.log(displayColorfulHeader());
+      const overrides = overridesFromOptions(options);
       try {
-        const { config, privateKey } = await setupProject(false, options.config);
-
-        if (privateKey || config.bunkerPubkey) {
-          const keyType = privateKey ? "private key" : "bunker connection";
-          const relayCount = config.relays.length;
-          const serverCount = config.servers.length;
-          const siteName = config.id || "root";
-
-          console.log(
-            colors.green(`\nProject initialized successfully with:`),
-          );
-          console.log(
-            colors.green(`- Site: ${siteName}`),
-          );
-          console.log(
-            colors.green(`- Authentication: ${keyType}`),
-          );
-          console.log(
-            colors.green(`- Relays: ${relayCount}`),
-          );
-          console.log(
-            colors.green(`- Blossom servers: ${serverCount}`),
-          );
-          console.log(
-            colors.green(`\nConfiguration saved to .nsite/config.json`),
-          );
-        }
+        const { config, privateKey } = await setupProject(false, options.config, overrides);
+        printInitSuccess(config, privateKey, "initialized");
 
         Deno.exit(0);
       } catch (error) {
@@ -54,12 +89,15 @@ export function registerInitCommand() {
             error.message === "Invalid JSON in configuration file"
           )
         ) {
-          // Ask user if they want to reinitialize
-          const shouldReinitialize = await Confirm.prompt({
-            message:
-              "Would you like to reinitialize the configuration? This will overwrite the existing invalid config.",
-            default: false,
-          });
+          // Ask user if they want to reinitialize. In non-interactive mode, skip
+          // the prompt and default to reinitializing (the override-driven setup
+          // will rebuild a valid config from scratch).
+          const shouldReinitialize = options.nonInteractive ||
+            await Confirm.prompt({
+              message:
+                "Would you like to reinitialize the configuration? This will overwrite the existing invalid config.",
+              default: false,
+            });
 
           if (shouldReinitialize) {
             // Delete the invalid config file
@@ -83,33 +121,8 @@ export function registerInitCommand() {
 
             // Try setup again
             try {
-              const { config, privateKey } = await setupProject(false, options.config);
-
-              if (privateKey || config.bunkerPubkey) {
-                const keyType = privateKey ? "private key" : "bunker connection";
-                const relayCount = config.relays.length;
-                const serverCount = config.servers.length;
-                const siteName = config.id || "root";
-
-                console.log(
-                  colors.green(`\nProject reinitialized successfully with:`),
-                );
-                console.log(
-                  colors.green(`- Site: ${siteName}`),
-                );
-                console.log(
-                  colors.green(`- Authentication: ${keyType}`),
-                );
-                console.log(
-                  colors.green(`- Relays: ${relayCount}`),
-                );
-                console.log(
-                  colors.green(`- Blossom servers: ${serverCount}`),
-                );
-                console.log(
-                  colors.green(`\nConfiguration saved to .nsite/config.json`),
-                );
-              }
+              const { config, privateKey } = await setupProject(false, options.config, overrides);
+              printInitSuccess(config, privateKey, "reinitialized");
 
               Deno.exit(0);
             } catch (retryError) {
@@ -134,4 +147,27 @@ export function registerInitCommand() {
         }
       }
     });
+}
+
+/** Print the standard post-init success summary. */
+function printInitSuccess(
+  config: { bunkerPubkey?: string; relays: string[]; servers: string[]; id?: string | null },
+  privateKey: string | undefined | null,
+  verb: "initialized" | "reinitialized",
+): void {
+  if (privateKey || config.bunkerPubkey) {
+    const keyType = privateKey ? "private key" : "bunker connection";
+    const relayCount = config.relays.length;
+    const serverCount = config.servers.length;
+    const siteName = config.id || "root";
+
+    console.log(
+      colors.green(`\nProject ${verb} successfully with:`),
+    );
+    console.log(colors.green(`- Site: ${siteName}`));
+    console.log(colors.green(`- Authentication: ${keyType}`));
+    console.log(colors.green(`- Relays: ${relayCount}`));
+    console.log(colors.green(`- Blossom servers: ${serverCount}`));
+    console.log(colors.green(`\nConfiguration saved to .nsite/config.json`));
+  }
 }
