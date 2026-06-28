@@ -75,7 +75,12 @@ export function registerInitCommand() {
       console.log(displayColorfulHeader());
       const overrides = overridesFromOptions(options);
       try {
-        const { config, privateKey } = await setupProject(false, options.config, overrides);
+        const result = await setupProject(false, options.config, overrides);
+        if (result.error) {
+          console.error(colors.red(`\n${result.error}`));
+          Deno.exit(1);
+        }
+        const { config, privateKey } = result;
         printInitSuccess(config, privateKey, "initialized");
 
         Deno.exit(0);
@@ -121,7 +126,12 @@ export function registerInitCommand() {
 
             // Try setup again
             try {
-              const { config, privateKey } = await setupProject(false, options.config, overrides);
+              const result = await setupProject(false, options.config, overrides);
+              if (result.error) {
+                console.error(colors.red(`\n${result.error}`));
+                Deno.exit(1);
+              }
+              const { config, privateKey } = result;
               printInitSuccess(config, privateKey, "reinitialized");
 
               Deno.exit(0);
